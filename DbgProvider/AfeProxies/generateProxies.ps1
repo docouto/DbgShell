@@ -16,6 +16,49 @@ function DoReplacements( [string] $inputFile, [string] $outputFile, [hashtable] 
 {
     try
     {
+        $viewFromPropertySupported_BeginStuff = @'
+            elseif( $Property )
+            {
+                # If there are no wildcards, we can just up the view now and not have to
+                # reevaluate for every object.
+                [bool] $hasWildcards = $false
+                foreach( $propThing in $Property )
+                {
+                    if( ($propThing -is [string]) -and
+                        [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters( $propThing ) )
+                    {
+                        $hasWildcards = $true
+                        break
+                    }
+                }
+
+                if( !$hasWildcards )
+                {
+                    $FormatInfo = VIEW_FROM_PROPERTY_COMMAND -FromProperty $Property
+                    $useSuppliedView = $true
+                }
+            }
+'@
+
+        $viewFromPropertySupported_ProcessStuff = @'
+                elseif( $Property -and !$UseBuiltinFormattingForPropertyViews )
+                {
+                    ${_formatInfo} = VIEW_FROM_PROPERTY_COMMAND `
+                                        -FromProperty $Property `
+                                        -InputObject $objToDealWith
+                }
+'@
+
+        $viewFromPropertyNotSupported_ProcessStuff = @'
+                elseif( $Property )
+                {
+                    # The corresponding alternate formatting engine command does not
+                    # [currently] support generating a view from -Property. We'll leave
+                    # $_formatInfo null so that the built-in formatting command will be
+                    # used.
+                }
+'@
+
         Write-Host "Creating $($outputFile)..." -Fore Cyan
         if( Test-Path $outputFile )
         {
@@ -38,6 +81,23 @@ function DoReplacements( [string] $inputFile, [string] $outputFile, [hashtable] 
         $repl[ 'FORMAT_SCRIPT_COMMAND' ] = "`$private:format$($baseInfo[ 'PROXY_SHAPE' ])ScriptCmd"
         $repl[ 'OUT_WRAPPED_COMMAND' ] = "`$private:out$($baseInfo[ 'PROXY_SHAPE' ])WrappedCmd"
         $repl[ 'OUT_SCRIPT_COMMAND' ] = "`$private:out$($baseInfo[ 'PROXY_SHAPE' ])ScriptCmd"
+
+        if( $baseInfo[ 'ViewFromPropertyCmd' ] )
+        {
+            $repl[ 'VIEW_FROM_PROPERTY_STUFF_BEGIN' ] =
+                $viewFromPropertySupported_BeginStuff.Replace( 'VIEW_FROM_PROPERTY_COMMAND',
+                                                               $baseInfo[ 'ViewFromPropertyCmd' ] )
+
+            $repl[ 'VIEW_FROM_PROPERTY_STUFF_PROCESS' ] =
+                $viewFromPropertySupported_ProcessStuff.Replace( 'VIEW_FROM_PROPERTY_COMMAND',
+                                                                 $baseInfo[ 'ViewFromPropertyCmd' ] )
+        }
+        else
+        {
+            $repl[ 'VIEW_FROM_PROPERTY_STUFF_BEGIN' ] = ''
+
+            $repl[ 'VIEW_FROM_PROPERTY_STUFF_PROCESS' ] = $viewFromPropertyNotSupported_ProcessStuff
+        }
 
         gc $inputFile | %{
             $line = $_
@@ -68,9 +128,9 @@ try
     # Format-* proxies
     #
     $proxyBaseInfos = @{
-        'Custom' = @{ 'SPEW_PREFIX' = 'FcProxy'; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113301' }
-        'List'   = @{ 'SPEW_PREFIX' = 'FlProxy'; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113302' }
-        'Table'  = @{ 'SPEW_PREFIX' = 'FtProxy'; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113303' }
+        'Custom' = @{ 'SPEW_PREFIX' = 'FcProxy'; 'ViewFromPropertyCmd' = ''                          ; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113301' }
+        'List'   = @{ 'SPEW_PREFIX' = 'FlProxy'; 'ViewFromPropertyCmd' = 'New-AltListViewDefinition' ; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113302' }
+        'Table'  = @{ 'SPEW_PREFIX' = 'FtProxy'; 'ViewFromPropertyCmd' = 'New-AltTableViewDefinition'; 'HELP_URI' = 'http://go.microsoft.com/fwlink/?LinkID=113303' }
     }
 
     foreach( $key in $proxyBaseInfos.Keys )

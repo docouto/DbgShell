@@ -61,7 +61,7 @@ namespace MS.Dbg.Formatting.Commands
         } // end ApplyViewToInputObject()
 
 
-        protected override void ResetState()
+        protected override void ResetState( bool newViewChosen )
         {
             // nothing to do
         } // end ResetState()

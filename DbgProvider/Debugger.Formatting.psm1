@@ -14,6 +14,13 @@ Set-StrictMode -Version Latest
 [bool] $__formatListProxyDebugSpew = ![string]::IsNullOrEmpty( $env:FormatListProxyDebugSpew )
 [bool] $__formatCustomProxyDebugSpew = ![string]::IsNullOrEmpty( $env:FormatCustomProxyDebugSpew )
 
+# The "calculated property" stuff for the alternate formatting engine is pretty new, so
+# here's an escape hatch to flip back to using the built-in formatting in such cases when
+# using the proxy function wrappers. (I mean, besides the existing escape hatch of just
+# directly specifying the built-in functions, like
+# Microsoft.PowerShell.Utility\Format-Table.
+[bool] $UseBuiltinFormattingForPropertyViews = ![string]::IsNullOrEmpty( $env:UseBuiltinFormattingForPropertyViews )
+
 <#
 .SYNOPSIS
     Allows you to preserve a null string when passing it to a .NET API.
@@ -229,6 +236,7 @@ function New-AltPropertyColumn
     [CmdletBinding()]
     param( [Parameter( Mandatory = $true, Position = 0 )]
            [ValidateNotNullOrEmpty()]
+           [Alias( 'Name' )] # for compatibility with -Property stuff
            [string] $PropertyName,
 
            [Parameter( Mandatory = $false, Position = 1 )]
@@ -298,6 +306,8 @@ function New-AltScriptColumn
 
            [Parameter( Mandatory = $true, Position = 1 )]
            [ValidateNotNull()]
+           [MS.Dbg.Commands.ScriptBlockTransformation()]
+           [Alias( 'Expression' )] # For compatibility with -Property stuff
            [ScriptBlock] $Script,
 
            [Parameter( Mandatory = $false )]
@@ -425,8 +435,8 @@ function New-AltColumns
 #>
 function New-AltTableViewDefinition
 {
-    [CmdletBinding()]
-    param( [Parameter( Mandatory = $true, Position = 0 )]
+    [CmdletBinding( DefaultParameterSetName = 'DefaultParamSet' )]
+    param( [Parameter( Mandatory = $true, Position = 0, ParameterSetName = 'DefaultParamSet' )]
            [ValidateNotNull()]
            [ScriptBlock] $Columns,
 
@@ -445,7 +455,19 @@ function New-AltTableViewDefinition
            [switch] $CaptureContext,
 
            [Parameter( Mandatory = $false )]
-           [switch] $PreserveHeaderContext
+           [switch] $PreserveHeaderContext,
+
+           [Parameter( Mandatory = $true, Position = 0, ParameterSetName = 'FromPropertyParamSet' )]
+           [object[]] $FromProperty,
+
+           # This is to support wildcards in the -Property case. Because we could get a
+           # different type of object every time through ProcessRecord, we may need to
+           # come up with a new table view, because a property name with a wildcard could
+           # resolve to different sets of properties for the different objects.
+           [Parameter( Mandatory = $false,
+                       ParameterSetName = 'FromPropertyParamSet',
+                       ValueFromPipeline = $true )]
+           [object] $InputObject
          )
     begin { }
     end { }
@@ -453,27 +475,65 @@ function New-AltTableViewDefinition
     {
         $private:columnList = New-Object System.Collections.Generic.List[MS.Dbg.Formatting.Column]
         [MS.Dbg.Formatting.Footer] $private:footer = $null
-        & $Columns | % {
-            if( $_ -is [MS.Dbg.Formatting.Column] )
+
+        if( $FromProperty )
+        {
+            foreach( $propThing in $FromProperty )
             {
-                $columnList.Add( $_ )
-            }
-            elseif( $_ -is [MS.Dbg.Formatting.Footer] )
-            {
-                if( $null -ne $footer )
+                if( $propThing -is [string] )
                 {
-                    $private:SourceLineNumber = (Get-PSCallStack)[2].ScriptLineNumber
-                    Write-Error -Message ([string]::Format( '{0}:{1} While registering a table view definition for type ''{2}'': The -Columns script block yielded more than one Footer.', $SourceScript, $SourceLineNumber, $TypeName )) -Category InvalidOperation -ErrorId 'ExtraFooters' -TargetObject $_
+                    if( [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters( $propThing ) )
+                    {
+                        $InputObject.PSObject.Properties.Match( $propThing ).Name | %{
+                            $columnList.Add( (New-AltPropertyColumn -PropertyName $_) )
+                        }
+                    }
+                    else
+                    {
+                        $columnList.Add( (New-AltPropertyColumn -PropertyName $propThing) )
+                    }
+                }
+                elseif( $propThing -is [hashtable] )
+                {
+                    if( $propThing[ 'Expression' ] -or $propThing[ 'Script' ] )
+                    {
+                        $columnList.Add( (New-AltScriptColumn @propThing) )
+                    }
+                    else
+                    {
+                        $columnList.Add( (New-AltPropertyColumn @propThing) )
+                    }
                 }
                 else
                 {
-                    $footer = $_
+                    throw "Unexpected property thing: $($propThing.GetType().FullName)"
                 }
             }
-            else
-            {
-                $private:SourceLineNumber = (Get-PSCallStack)[2].ScriptLineNumber
-                Write-Warning ([string]::Format( '{0}:{1} While registering a table view definition for type ''{2}'': The -Columns script block yielded an item that was not a column definition: {3}', $SourceScript, $SourceLineNumber, $TypeName, $_ ))
+        }
+        else
+        {
+            & $Columns | % {
+                if( $_ -is [MS.Dbg.Formatting.Column] )
+                {
+                    $columnList.Add( $_ )
+                }
+                elseif( $_ -is [MS.Dbg.Formatting.Footer] )
+                {
+                    if( $null -ne $footer )
+                    {
+                        $private:SourceLineNumber = (Get-PSCallStack)[2].ScriptLineNumber
+                        Write-Error -Message ([string]::Format( '{0}:{1} While registering a table view definition for type ''{2}'': The -Columns script block yielded more than one Footer.', $SourceScript, $SourceLineNumber, $TypeName )) -Category InvalidOperation -ErrorId 'ExtraFooters' -TargetObject $_
+                    }
+                    else
+                    {
+                        $footer = $_
+                    }
+                }
+                else
+                {
+                    $private:SourceLineNumber = (Get-PSCallStack)[2].ScriptLineNumber
+                    Write-Warning ([string]::Format( '{0}:{1} While registering a table view definition for type ''{2}'': The -Columns script block yielded an item that was not a column definition: {3}', $SourceScript, $SourceLineNumber, $TypeName, $_ ))
+                }
             }
         }
 
@@ -615,6 +675,7 @@ function New-AltScriptListItem
            [string] $Label,
 
            [Parameter( Mandatory = $true, Position = 1 )]
+           [MS.Dbg.Commands.ScriptBlockTransformation()]
            [ValidateNotNull()]
            [ScriptBlock] $Script,
 
@@ -1766,6 +1827,9 @@ function Out-String
 } # end Out-String proxy
 
 
+# TODO: add some help; the HelpUri doesn't seem to do anything?
+# Mention how to get to the original Format-Table in case of emergency
+# (Microsoft.PowerShell.Utility\Format-Table)
 function Format-Table
 {
     [CmdletBinding( HelpUri = 'http://go.microsoft.com/fwlink/?LinkID=113303' )]
@@ -1835,6 +1899,27 @@ function Format-Table
             if( $null -ne $FormatInfo )
             {
                 $useSuppliedView = $true
+            }
+            elseif( $Property )
+            {
+                # If there are no wildcards, we can just up the view now and not have to
+                # reevaluate for every object.
+                [bool] $hasWildcards = $false
+                foreach( $propThing in $Property )
+                {
+                    if( ($propThing -is [string]) -and
+                        [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters( $propThing ) )
+                    {
+                        $hasWildcards = $true
+                        break
+                    }
+                }
+
+                if( !$hasWildcards )
+                {
+                    $FormatInfo = New-AltTableViewDefinition -FromProperty $Property
+                    $useSuppliedView = $true
+                }
             }
         }
         catch
@@ -1930,6 +2015,12 @@ function Format-Table
                 if( $useSuppliedView )
                 {
                     ${_formatInfo} = $FormatInfo
+                }
+                elseif( $Property -and !$UseBuiltinFormattingForPropertyViews )
+                {
+                    ${_formatInfo} = New-AltTableViewDefinition `
+                                        -FromProperty $Property `
+                                        -InputObject $objToDealWith
                 }
                 else
                 {
@@ -2119,6 +2210,27 @@ function Format-List
             {
                 $useSuppliedView = $true
             }
+            elseif( $Property )
+            {
+                # If there are no wildcards, we can just up the view now and not have to
+                # reevaluate for every object.
+                [bool] $hasWildcards = $false
+                foreach( $propThing in $Property )
+                {
+                    if( ($propThing -is [string]) -and
+                        [System.Management.Automation.WildcardPattern]::ContainsWildcardCharacters( $propThing ) )
+                    {
+                        $hasWildcards = $true
+                        break
+                    }
+                }
+
+                if( !$hasWildcards )
+                {
+                    $FormatInfo = New-AltListViewDefinition -FromProperty $Property
+                    $useSuppliedView = $true
+                }
+            }
         }
         catch
         {
@@ -2213,6 +2325,12 @@ function Format-List
                 if( $useSuppliedView )
                 {
                     ${_formatInfo} = $FormatInfo
+                }
+                elseif( $Property -and !$UseBuiltinFormattingForPropertyViews )
+                {
+                    ${_formatInfo} = New-AltListViewDefinition `
+                                        -FromProperty $Property `
+                                        -InputObject $objToDealWith
                 }
                 else
                 {
@@ -2405,6 +2523,7 @@ function Format-Custom
             {
                 $useSuppliedView = $true
             }
+
         }
         catch
         {
@@ -2499,6 +2618,13 @@ function Format-Custom
                 if( $useSuppliedView )
                 {
                     ${_formatInfo} = $FormatInfo
+                }
+                elseif( $Property )
+                {
+                    # The corresponding alternate formatting engine command does not
+                    # [currently] support generating a view from -Property. We'll leave
+                    # $_formatInfo null so that the built-in formatting command will be
+                    # used.
                 }
                 else
                 {
